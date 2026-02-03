@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log, sqrt, erf, isfinite
+from math import exp, log, sqrt, erf
 from typing import Literal
 
 
