@@ -221,12 +221,50 @@ if __name__ == "__main__":
     S0 = 80.0
     delta0 = 0.08
 
+    print("=" * 70)
+    print("GIBSON-SCHWARTZ MODEL PRICING")
+    print("=" * 70)
+    print(f"\nModel Parameters:")
+    print(f"  Risk-free rate r: {params.r:.4f}")
+    print(f"  Mean reversion κ: {params.kappa:.4f}")
+    print(f"  Long-run yield δ̄: {params.delta_bar_q:.4f}")
+    print(f"  Spot volatility σ_S: {params.sigma_s:.4f}")
+    print(f"  Yield volatility σ_δ: {params.sigma_delta:.4f}")
+    print(f"  Correlation ρ: {params.rho:.4f}")
+    
+    print(f"\nMarket State:")
+    print(f"  Spot price S0: {S0:.2f}")
+    print(f"  Convenience yield δ0: {delta0:.4f}")
+    
+    # Futures pricing for different maturities
+    print(f"\n{'FUTURES PRICES':-^70}")
+    maturities = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+    print(f"{'Maturity (years)':<20} {'Maturity (months)':<20} {'Futures Price':<15}")
+    print("-" * 70)
+    for T in maturities:
+        F = futures_price(S0, delta0, T, params)
+        print(f"{T:<20.2f} {T*12:<20.1f} {F:<15.4f}")
+    
+    # Options pricing
+    print(f"\n{'OPTIONS ON FUTURES':-^70}")
     h = 0.25   # option expiry in 3 months
     u = 0.75   # futures matures 9 months after option expiry (so total 1 year from now)
     K = 82.0
-
+    
+    F0 = futures_price(S0, delta0, h + u, params)
+    
+    print(f"\nOption Setup:")
+    print(f"  Strike K: {K:.2f}")
+    print(f"  Option expiry: {h:.4f} years ({h*12:.1f} months)")
+    print(f"  Future maturity (from option expiry): {u:.4f} years ({u*12:.1f} months)")
+    print(f"  Total future maturity: {h+u:.4f} years ({(h+u)*12:.1f} months)")
+    print(f"  Underlying futures price: {F0:.4f}")
+    print(f"  Moneyness (F/K): {F0/K:.4f}")
+    
     call_px = price_option_on_future_gibson_schwartz(S0, delta0, K, h, u, params, "call")
     put_px  = price_option_on_future_gibson_schwartz(S0, delta0, K, h, u, params, "put")
 
-    print(f"Call price: {call_px:.6f}")
-    print(f"Put  price: {put_px:.6f}")
+    print(f"\nOption Prices:")
+    print(f"  Call price: {call_px:.6f}")
+    print(f"  Put  price: {put_px:.6f}")
+    print("=" * 70)
