@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from math import exp, sqrt
 from typing import Literal
 
-from option_pricer import (
+from gs_model_pricer import (
     GibsonSchwartzParams,
     futures_price,
     price_option_on_future_gibson_schwartz,
@@ -62,7 +62,7 @@ def simulate_gibson_schwartz(
     for i in range(n_steps):
         # Generate independent standard normals
         Z = np.random.randn(n_sims, 2)
-        
+
         # Correlate them
         W = Z @ chol.T  # W[:, 0] is dW1, W[:, 1] is dW2
         
