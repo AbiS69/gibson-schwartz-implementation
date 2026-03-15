@@ -1,0 +1,740 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+# Gibson-Schwartz (1997) Two-Factor Commodity Model
+# Kalman Filter with Maximum Likelihood Estimation
+# 
+# This implementation follows Schwartz (1997) for analytical formulas of A(tau) and B(tau).
+# Numerically robust version using pseudo-inverse and parameter bounds.
+
+# Load required packages
+if (!require(readxl, quietly = TRUE)) install.packages("readxl")
+if (!require(ggplot2, quietly = TRUE)) install.packages("ggplot2")
+if (!require(gridExtra, quietly = TRUE)) install.packages("gridExtra")
+if (!require(Matrix, quietly = TRUE)) install.packages("Matrix")
+if (!require(R6, quietly = TRUE)) install.packages("R6")
+if (!require(MASS, quietly = TRUE)) install.packages("MASS")
+if (!require(reshape2, quietly = TRUE)) install.packages("reshape2")
+
+library(readxl)
+library(ggplot2)
+library(gridExtra)
+library(Matrix)
+library(R6)
+library(MASS)
+library(reshape2)
+
+# ============================================================================
+# GibsonSchwartz Class (implemented as R6 class)
+# ============================================================================
+
+GibsonSchwartz <- R6::R6Class(
+  "GibsonSchwartz",
+  
+  public = list(
+    # Public members
+    spot_prices = NULL,
+    futures_prices = NULL,
+    maturities = NULL,
+    risk_free_rates = NULL,
+    dt = 1/252,
+    n_obs = NULL,
+    n_contracts = NULL,
+    log_spot = NULL,
+    log_futures = NULL,
+    params = NULL,
+    filtered_states = NULL,
+    
+    # Constructor
+    initialize = function(spot_prices, futures_prices, maturities, risk_free_rates, dt = 1/252) {
+      # Initialize the Gibson-Schwartz model
+      self$spot_prices <- as.numeric(spot_prices)
+      self$futures_prices <- as.matrix(futures_prices)
+      self$maturities <- as.numeric(maturities)
+      self$risk_free_rates <- as.numeric(risk_free_rates)
+      self$dt <- dt
+      self$n_obs <- length(spot_prices)
+      self$n_contracts <- if(is.null(ncol(futures_prices))) 1 else ncol(futures_prices)
+      
+      # Check dimensions
+      if (length(self$risk_free_rates) != self$n_obs) {
+        stop(paste("risk_free_rates length (", length(self$risk_free_rates), 
+                   ") must match observations (", self$n_obs, ")", sep = ""))
+      }
+      
+      # Convert to log-spot and log-futures
+      self$log_spot <- log(self$spot_prices)
+      if (is.null(ncol(futures_prices))) {
+        self$log_futures <- matrix(log(futures_prices), ncol = 1)
+      } else {
+        self$log_futures <- log(futures_prices)
+      }
+    },
+    
+    # B_tau method
+    B_tau = function(tau, kappa) {
+      result <- ifelse(kappa < 1e-6, tau, (1.0 - exp(-kappa * tau)) / kappa)
+      return(result)
+    },
+    
+    # A_tau method
+    A_tau = function(tau, kappa, sigma_1, sigma_2, rho, r, delta_bar_q) {
+      k <- kappa
+      ss <- sigma_1
+      sd <- sigma_2
+      
+      e1 <- exp(-k * tau)
+      e2 <- exp(-2.0 * k * tau)
+      
+      b <- self$B_tau(tau, k)
+      
+      # Variance correction term
+      term_delta <- sd^2 * (
+        (tau / (k^2))
+        - (2.0 * (1.0 - e1) / (k^3))
+        + ((1.0 - e2) / (2.0 * k^3))
+      )
+      
+      term_cross <- -2.0 * rho * ss * sd * (
+        (tau / k) - ((1.0 - e1) / (k^2))
+      )
+      
+      v <- term_delta + term_cross
+      
+      return(r * tau - delta_bar_q * (tau - b) + 0.5 * v)
+    },
+    
+    # Kalman filter method
+    kalman_filter = function(params) {
+      # Unpack and clip parameters
+      kappa <- pmax(pmin(params[1], 5.0), 0.01)
+      sigma_1 <- pmax(pmin(params[2], 2.0), 0.01)
+      sigma_2 <- pmax(pmin(params[3], 2.0), 0.01)
+      rho <- pmax(pmin(params[4], 0.99), -0.99)
+      lambda_param <- pmax(pmin(params[5], 0.5), -0.5)
+      mu_s <- pmax(pmin(params[6], 1.0), 0.0)
+      delta_bar_q <- pmax(pmin(params[7], 1.0), 0.0)
+      
+      tryCatch({
+        # Build transition matrices (G and c for discrete-time)
+        exp_k <- exp(-kappa * self$dt)
+        G <- matrix(c(1.0, 0.0, -self$dt, exp_k), nrow = 2, ncol = 2, byrow = FALSE)
+        
+        # Process noise covariance Q (independent of time-varying r)
+        var_x <- sigma_1^2 * self$dt
+        var_delta <- sigma_2^2 * (1.0 - exp(-2.0 * kappa * self$dt)) / (2.0 * kappa + 1e-8)
+        cov_x_delta <- rho * sigma_1 * sigma_2 * (1.0 - exp_k) / (kappa + 1e-8)
+        
+        Q <- matrix(c(var_x, cov_x_delta, cov_x_delta, var_delta), nrow = 2, ncol = 2, byrow = FALSE)
+        
+        # Ensure Q is positive definite
+        Q <- (Q + t(Q)) / 2
+        eigs_Q <- eigen(Q)$values
+        if (any(eigs_Q < 1e-8)) {
+          Q <- Q + diag(2) * (1e-7 - min(eigs_Q))
+        }
+        
+        # Build measurement matrices
+        B_vals <- sapply(self$maturities, function(tau) self$B_tau(tau, kappa))
+        Z <- matrix(0, nrow = self$n_contracts, ncol = 2)
+        Z[, 1] <- 1.0
+        Z[, 2] <- -B_vals
+        
+        # Measurement noise covariance
+        H <- diag(self$n_contracts) * 1e-3
+        
+        # Initialize filter
+        x <- c(self$log_spot[1], mu_s)
+        P <- diag(2) * 100.0
+        
+        log_likelihood <- 0.0
+        n_valid <- 0
+        
+        # Kalman filter loop
+        for (t in 1:self$n_obs) {
+          # Get time-varying risk-free rate
+          r_t <- self$risk_free_rates[t]
+          
+          # Update drift term in state equation with r_t
+          c <- c(
+            (r_t - lambda_param - 0.5 * sigma_1^2) * self$dt,
+            mu_s * (1.0 - exp_k)
+          )
+          
+          # Recompute d with current r_t (risk-neutral pricing)
+          d <- sapply(self$maturities, function(tau) 
+            self$A_tau(tau, kappa, sigma_1, sigma_2, rho, r_t, delta_bar_q)
+          )
+          
+          # Prediction
+          x_pred <- c + G %*% x
+          P_pred <- G %*% P %*% t(G) + Q
+          
+          # Ensure P_pred is symmetric and positive definite
+          P_pred <- (P_pred + t(P_pred)) / 2
+          eigs_p <- eigen(P_pred)$values
+          if (any(eigs_p < 1e-10)) {
+            P_pred <- P_pred + diag(2) * (1e-9 - min(eigs_p))
+          }
+          
+          # Measurement update
+          y_pred <- d + Z %*% x_pred
+          innovation <- self$log_futures[t, ] - y_pred
+          
+          # Innovation covariance
+          S <- Z %*% P_pred %*% t(Z) + H
+          S <- (S + t(S)) / 2
+          
+          # Use pseudo-inverse for numerical stability
+          tryCatch({
+            S_inv <- MASS::ginv(S)
+            det_S <- det(S)
+            
+            if (det_S > 1e-30 && is.finite(det_S)) {
+              # Kalman gain
+              K <- P_pred %*% t(Z) %*% S_inv
+              
+              # Update state and covariance
+              x <- x_pred + K %*% innovation
+              P <- (diag(2) - K %*% Z) %*% P_pred
+              
+              # Log-likelihood contribution
+              mahal <- as.numeric(t(innovation) %*% S_inv %*% innovation)
+              if (is.finite(mahal) && mahal < 1000) {
+                ll_t <- -0.5 * (self$n_contracts * log(2 * pi) + log(det_S) + mahal)
+                if (is.finite(ll_t)) {
+                  log_likelihood <- log_likelihood + ll_t
+                  n_valid <- n_valid + 1
+                }
+              }
+            }
+          }, error = function(e) {
+            # Silent catch
+          })
+        }
+        
+        if (n_valid < 50) {  # Need sufficient valid observations
+          return(1e10)
+        }
+        
+        # Normalize by number of valid observations
+        avg_ll <- log_likelihood / n_valid
+        
+        # Return negative log-likelihood for minimization
+        return(-avg_ll)
+        
+      }, error = function(e) {
+        return(1e10)
+      })
+    },
+    
+    # Fit method
+    fit = function(verbose = TRUE, method = 'L-BFGS-B') {
+      # Initial parameter guess
+      # Parameters: [kappa, sigma_1, sigma_2, rho, lambda, mu_s, delta_bar_q]
+      initial_params <- c(
+        0.5,     # kappa
+        0.25,    # sigma_1
+        0.25,    # sigma_2
+        0.3,     # rho
+        0.0,     # lambda
+        0.05,    # mu_s
+        0.05     # delta_bar_q
+      )
+      
+      # Parameter bounds
+      lower_bounds <- c(0.01, 0.01, 0.01, -0.99, -0.5, 0.0, 0.0)
+      upper_bounds <- c(5.0, 2.0, 2.0, 0.99, 0.5, 1.0, 1.0)
+      
+      if (verbose) {
+        cat("\nStarting MLE optimization...\n")
+      }
+      
+      # Optimize
+      result <- optim(
+        initial_params,
+        fn = function(p) self$kalman_filter(p),
+        method = method,
+        lower = lower_bounds,
+        upper = upper_bounds,
+        control = list(maxit = 200)
+      )
+      
+      if (verbose) {
+        cat("Optimization completed.\n")
+        cat(sprintf("Final log-likelihood: %.6f\n", -result$value))
+      }
+      
+      self$params <- result$par
+      return(result)
+    },
+    
+    # Print parameters method
+    print_parameters = function() {
+      if (is.null(self$params)) {
+        cat("Model not fitted yet.\n")
+        return()
+      }
+      
+      param_names <- c('kappa', 'sigma_1', 'sigma_2', 'rho', 'lambda', 'mu_s', 'delta_bar_q')
+      
+      cat(strrep("=", 65), "\n")
+      cat("GIBSON-SCHWARTZ MODEL - FITTED PARAMETERS (BRENT CRUDE OIL)\n")
+      cat(strrep("=", 65), "\n")
+      
+      for (i in seq_along(param_names)) {
+        cat(sprintf("%-20s: %12.8f\n", param_names[i], self$params[i]))
+      }
+      
+      cat(strrep("=", 65), "\n")
+      cat("\nParameter Interpretation:\n")
+      cat(sprintf("  κ (mean reversion): %.4f - Controls speed of convenience yield reversion\n", self$params[1]))
+      cat(sprintf("  σ₁ (spot vol):      %.4f - Volatility of log-spot price\n", self$params[2]))
+      cat(sprintf("  σ₂ (delta vol):     %.4f - Volatility of convenience yield\n", self$params[3]))
+      cat(sprintf("  ρ (correlation):    %.4f - Correlation between spot and delta shocks\n", self$params[4]))
+      cat(sprintf("  λ (market price):   %.4f - Market price of risk\n", self$params[5]))
+      cat(sprintf("  μₛ (long-run δ):    %.4f - Long-run convenience yield level\n", self$params[6]))
+    },
+    
+    # Extract states method
+    extract_states = function() {
+      if (is.null(self$params)) {
+        stop("Model not fitted. Call fit() first.")
+      }
+      
+      kappa <- self$params[1]
+      sigma_1 <- self$params[2]
+      sigma_2 <- self$params[3]
+      rho <- self$params[4]
+      lambda_param <- self$params[5]
+      mu_s <- self$params[6]
+      delta_bar_q <- self$params[7]
+      
+      # Build matrices
+      exp_k <- exp(-kappa * self$dt)
+      G <- matrix(c(1.0, 0.0, -self$dt, exp_k), nrow = 2, ncol = 2, byrow = FALSE)
+      
+      var_x <- sigma_1^2 * self$dt
+      var_delta <- sigma_2^2 * (1.0 - exp(-2.0 * kappa * self$dt)) / (2.0 * kappa + 1e-8)
+      cov_x_delta <- rho * sigma_1 * sigma_2 * (1.0 - exp_k) / (kappa + 1e-8)
+      Q <- matrix(c(var_x, cov_x_delta, cov_x_delta, var_delta), nrow = 2, ncol = 2, byrow = FALSE)
+      Q <- (Q + t(Q)) / 2
+      
+      B_vals <- sapply(self$maturities, function(tau) self$B_tau(tau, kappa))
+      Z <- matrix(0, nrow = self$n_contracts, ncol = 2)
+      Z[, 1] <- 1.0
+      Z[, 2] <- -B_vals
+      
+      H <- diag(self$n_contracts) * 1e-5
+      
+      # Initialize
+      x <- c(self$log_spot[1], mu_s)
+      P <- diag(2) * 100.0
+      
+      states <- matrix(0, nrow = self$n_obs, ncol = 2)
+      
+      # Filter loop
+      for (t in 1:self$n_obs) {
+        r_t <- self$risk_free_rates[t]
+        
+        c <- c(
+          (r_t - lambda_param - 0.5 * sigma_1^2) * self$dt,
+          mu_s * (1.0 - exp_k)
+        )
+        
+        d <- sapply(self$maturities, function(tau) 
+          self$A_tau(tau, kappa, sigma_1, sigma_2, rho, r_t, delta_bar_q)
+        )
+        
+        x_pred <- c + G %*% x
+        P_pred <- G %*% P %*% t(G) + Q
+        P_pred <- (P_pred + t(P_pred)) / 2
+        
+        y_pred <- d + Z %*% x_pred
+        innovation <- self$log_futures[t, ] - y_pred
+        S <- Z %*% P_pred %*% t(Z) + H
+        S <- (S + t(S)) / 2
+        
+        tryCatch({
+          S_inv <- MASS::ginv(S)
+          K <- P_pred %*% t(Z) %*% S_inv
+          x <- x_pred + K %*% innovation
+          P <- (diag(2) - K %*% Z) %*% P_pred
+        }, error = function(e) {
+          # Silent catch
+        })
+        
+        states[t, ] <- x
+      }
+      
+      self$filtered_states <- states
+      spot_estimated <- exp(states[, 1])
+      convenience_yield <- states[, 2]
+      
+      return(list(spot = spot_estimated, delta = convenience_yield))
+    },
+    
+    # Plot results method
+    plot_results = function() {
+      if (is.null(self$filtered_states)) {
+        result <- self$extract_states()
+      }
+      
+      spot_est <- exp(self$filtered_states[, 1])
+      dy <- self$filtered_states[, 2]
+      time_idx <- 1:length(self$spot_prices)
+      
+      # Create data frame for plotting
+      df_plot <- data.frame(
+        time = c(time_idx, time_idx),
+        price = c(self$spot_prices, spot_est),
+        type = c(rep("Actual", length(time_idx)), rep("Estimated", length(time_idx)))
+      )
+      
+      df_dy <- data.frame(
+        time = time_idx,
+        delta = dy
+      )
+      
+      # Plot 1: Spot Price
+      p1 <- ggplot(df_plot, aes(x = time, y = price, color = type, linetype = type)) +
+        geom_line(size = 0.8) +
+        scale_color_manual(values = c("Actual" = "blue", "Estimated" = "red")) +
+        scale_linetype_manual(values = c("Actual" = "solid", "Estimated" = "dashed")) +
+        labs(
+          x = "Time (days)",
+          y = "Price ($/barrel)",
+          title = "Brent Crude Oil: Actual vs Filtered Spot Price"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "top"
+        )
+      
+      rmse_spot <- sqrt(mean((self$spot_prices - spot_est)^2))
+      p1 <- p1 + annotate("text", x = Inf, y = -Inf, 
+                          label = paste0("RMSE: $", round(rmse_spot, 4), "/barrel"),
+                          hjust = 1.1, vjust = -0.5, size = 3, color = "black")
+      
+      # Plot 2: Convenience Yield
+      p2 <- ggplot(df_dy, aes(x = time, y = delta)) +
+        geom_line(color = "green", size = 0.8) +
+        geom_ribbon(aes(ymin = 0, ymax = pmax(delta, 0)), fill = "green", alpha = 0.3) +
+        geom_ribbon(aes(ymin = pmin(delta, 0), ymax = 0), fill = "red", alpha = 0.3) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 0.5) +
+        labs(
+          x = "Time (days)",
+          y = "Convenience Yield",
+          title = "Brent Crude Oil: Estimated Instantaneous Convenience Yield"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(size = 12, face = "bold")
+        )
+      
+      # Combine plots
+      combined_plot <- gridExtra::grid.arrange(p1, p2, nrow = 2, heights = c(1, 1))
+      
+      ggsave("gs_model_results.png", combined_plot, width = 14, height = 10, dpi = 150)
+      cat("Plot saved: gs_model_results.png\n")
+    },
+    
+    # Plot futures method
+    plot_futures = function() {
+      if (is.null(self$params)) {
+        stop("Model not fitted.")
+      }
+      
+      kappa <- self$params[1]
+      sigma_1 <- self$params[2]
+      sigma_2 <- self$params[3]
+      rho <- self$params[4]
+      lambda_param <- self$params[5]
+      mu_s <- self$params[6]
+      delta_bar_q <- self$params[7]
+      
+      B_vals <- sapply(self$maturities, function(tau) self$B_tau(tau, kappa))
+      Z <- matrix(0, nrow = self$n_contracts, ncol = 2)
+      Z[, 1] <- 1.0
+      Z[, 2] <- -B_vals
+      
+      if (is.null(self$filtered_states)) {
+        self$extract_states()
+      }
+      
+      # Compute fitted log-futures for each time step with time-varying r
+      exp_k <- exp(-kappa * self$dt)
+      fitted_list <- list()
+      
+      for (t in 1:self$n_obs) {
+        r_t <- self$risk_free_rates[t]
+        d <- sapply(self$maturities, function(tau) 
+          self$A_tau(tau, kappa, sigma_1, sigma_2, rho, r_t, delta_bar_q)
+        )
+        log_fitted_t <- d + Z %*% self$filtered_states[t, ]
+        fitted_list[[t]] <- exp(log_fitted_t)
+      }
+      
+      fitted <- do.call(rbind, fitted_list)
+      
+      # Create plots for each contract
+      n_cont <- self$n_contracts
+      n_rows <- ceiling(n_cont / 2)
+      
+      plots_list <- list()
+      
+      for (i in 1:n_cont) {
+        actual <- self$futures_prices[, i]
+        df_futures <- data.frame(
+          time = 1:self$n_obs,
+          actual = actual,
+          fitted = fitted[, i]
+        )
+        
+        df_futures_long <- reshape2::melt(df_futures, id.vars = "time")
+        
+        p <- ggplot(df_futures_long, aes(x = time, y = value, color = variable, linetype = variable)) +
+          geom_line(size = 0.8) +
+          scale_color_manual(values = c("actual" = "blue", "fitted" = "red")) +
+          scale_linetype_manual(values = c("actual" = "solid", "fitted" = "dashed")) +
+          labs(
+            x = "Time (days)",
+            y = "Futures Price ($/barrel)",
+            title = sprintf("Brent Contract %d (τ = %.3f yrs)", i, self$maturities[i])
+          ) +
+          theme_minimal() +
+          theme(
+            plot.title = element_text(size = 11, face = "bold"),
+            legend.position = "top"
+          )
+        
+        rmse <- sqrt(mean((actual - fitted[, i])^2))
+        p <- p + annotate("text", x = Inf, y = -Inf, 
+                         label = paste0("RMSE: ", round(rmse, 4)),
+                         hjust = 1.1, vjust = -0.5, size = 3, color = "black")
+        
+        plots_list[[i]] <- p
+      }
+      
+      # Combine plots
+      combined_plot <- do.call(gridExtra::grid.arrange, c(plots_list, list(nrow = n_rows)))
+      
+      ggsave("gs_futures_comparison.png", combined_plot, width = 15, height = 4 * n_rows, dpi = 150)
+      cat("Plot saved: gs_futures_comparison.png\n")
+    }
+  )
+)
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+main <- function() {
+  cat("\n")
+  cat(strrep("=", 65), "\n")
+  cat("GIBSON-SCHWARTZ TWO-FACTOR COMMODITY PRICING MODEL\n")
+  cat("BRENT CRUDE OIL ANALYSIS\n")
+  cat(strrep("=", 65), "\n")
+  
+  # Load data
+  cat("\nLoading Brent time series data...\n")
+  
+  # Check if file exists
+  excel_file <- 'TimesSeries_BRENT.xlsx'
+  if (!file.exists(excel_file)) {
+    cat("ERROR: File '", excel_file, "' not found in working directory!\n", sep = "")
+    cat("Current working directory: ", getwd(), "\n", sep = "")
+    cat("Please ensure TimesSeries_BRENT.xlsx is in the working directory.\n")
+    return()
+  }
+  
+  df <- NULL
+  tryCatch({
+    # Try to read from Excel file with 'Feuil1' sheet (French for Sheet1)
+    df <- read_excel(excel_file, sheet = 'Feuil1')
+  }, error = function(e) {
+    cat("Note: Could not read 'Feuil1' sheet, trying default sheet...\n")
+  })
+  
+  if (is.null(df)) {
+    tryCatch({
+      # Fallback to first sheet if 'Feuil1' doesn't exist
+      df <- read_excel(excel_file, sheet = 1)
+    }, error = function(e2) {
+      cat("ERROR: Could not read Excel file!\n")
+      cat("Error message: ", e2$message, "\n", sep = "")
+      return()
+    })
+  }
+  
+  if (is.null(df)) {
+    cat("ERROR: Failed to load data.\n")
+    return()
+  }
+  
+  cat("✓ Data loaded successfully\n")
+  cat(sprintf("  Dimensions: %d rows × %d columns\n", nrow(df), ncol(df)))
+  cat(sprintf("  Available columns: %s\n", paste(names(df), collapse = ", ")))
+  
+  # Extract spot prices from F1 (first futures contract as proxy for spot)
+  if (!("F1" %in% names(df))) {
+    cat("ERROR: Column 'F1' not found in data\n")
+    cat("Available columns are: ", paste(names(df), collapse = ", "), "\n", sep = "")
+    return()
+  }
+  
+  # Get clean indices (remove NaN from spot AND risk-free rates simultaneously)
+  spot_raw <- as.numeric(df$F1)
+  valid_idx <- !is.na(spot_raw)
+  spot <- spot_raw[valid_idx]
+  
+  cat(sprintf("✓ Extracted %d spot prices from column F1\n", length(spot)))
+  cat(sprintf("  Spot price range: $%.2f - $%.2f\n", min(spot, na.rm = TRUE), max(spot, na.rm = TRUE)))
+  
+  # Get risk-free rates and apply same valid indices
+  if ("T-Bill_1M" %in% names(df)) {
+    risk_free_rates_raw <- as.numeric(df[["T-Bill_1M"]])
+    
+    if (length(risk_free_rates_raw) >= length(spot_raw)) {
+      risk_free_rates <- risk_free_rates_raw[valid_idx]
+      
+      # Convert to decimal if in percentage (assume > 0.5 means percentage)
+      if (max(risk_free_rates, na.rm = TRUE) > 0.5) {
+        risk_free_rates <- risk_free_rates / 100.0
+        cat("✓ Risk-free rates converted from percentage to decimal\n")
+      }
+      
+      # Handle any NaN values in risk-free rates by forward-filling
+      for (i in seq_along(risk_free_rates)) {
+        if (is.na(risk_free_rates[i])) {
+          if (i > 1) {
+            risk_free_rates[i] <- risk_free_rates[i - 1]
+          } else {
+            risk_free_rates[i] <- 0.02
+          }
+        }
+      }
+    } else {
+      cat("⚠ Warning: Insufficient T-Bill_1M data. Using default 2% rate.\n")
+      risk_free_rates <- rep(0.02, length(spot))
+    }
+  } else {
+    cat("⚠ Warning: Column 'T-Bill_1M' not found. Using default 2% rate.\n")
+    risk_free_rates <- rep(0.02, length(spot))
+  }
+  
+  cat(sprintf("✓ Risk-free rate range: %.6f - %.6f\n", min(risk_free_rates), max(risk_free_rates)))
+  
+  # Extract futures prices and maturities
+  futures_list <- list()
+  maturities <- c()
+  
+  # Futures contracts: F1, F2, F3, F4, F5 with corresponding maturities
+  futures_cols <- c('F1', 'F2', 'F3', 'F4', 'F5')
+  
+  # Maturity mapping for Brent crude futures (typical tenor structure)
+  maturity_dict <- list(
+    F1 = 1/12,      # 1 month
+    F2 = 5/12,      # 5 months
+    F3 = 9/12,      # 9 months
+    F4 = 13/12,     # 13 months
+    F5 = 17/12      # 17 months
+  )
+  
+  cat("\nLoading futures contracts:\n")
+  for (col in futures_cols) {
+    if (col %in% names(df)) {
+      tryCatch({
+        prices_raw <- as.numeric(df[[col]])
+        prices <- prices_raw[valid_idx]
+        
+        if (length(prices) == length(spot)) {
+          futures_list[[col]] <- prices
+          maturities <- c(maturities, maturity_dict[[col]])
+          cat(sprintf("  ✓ %s: tau = %.3f years (%.0f months)\n", 
+                     col, maturity_dict[[col]], maturity_dict[[col]] * 12))
+        }
+      }, error = function(e) {
+        cat(sprintf("  ✗ %s: Could not load - %s\n", col, e$message))
+      })
+    }
+  }
+  
+  if (length(futures_list) == 0) {
+    cat("ERROR: No futures data could be loaded\n")
+    return()
+  }
+  
+  futures <- do.call(cbind, futures_list)
+  maturities <- as.numeric(maturities)
+  
+  cat(sprintf("\n  ✓ Observations: %d\n", length(spot)))
+  cat(sprintf("  ✓ Spot price range: $%.2f - $%.2f\n", min(spot), max(spot)))
+  cat(sprintf("  ✓ Futures contracts loaded: %d\n", length(maturities)))
+  cat(sprintf("  ✓ Maturities: %s\n", paste(round(maturities, 3), collapse = ", ")))
+  
+  # Create and fit model
+  cat("\nInitializing Gibson-Schwartz model...\n")
+  tryCatch({
+    model <- GibsonSchwartz$new(spot, futures, maturities, risk_free_rates)
+    cat("✓ Model initialized successfully\n")
+  }, error = function(e) {
+    cat("ERROR: Could not initialize model - ", e$message, "\n", sep = "")
+    return()
+  })
+  
+  cat("\n")
+  cat(strrep("=", 65), "\n")
+  cat("MAXIMUM LIKELIHOOD ESTIMATION\n")
+  cat(strrep("=", 65), "\n")
+  
+  tryCatch({
+    model$fit(verbose = TRUE)
+    model$print_parameters()
+  }, error = function(e) {
+    cat("ERROR: Optimization failed - ", e$message, "\n", sep = "")
+    return()
+  })
+  
+  # Extract states and plot
+  cat("\n")
+  cat(strrep("=", 65), "\n")
+  cat("GENERATING RESULTS\n")
+  cat(strrep("=", 65), "\n")
+  
+  tryCatch({
+    states_result <- model$extract_states()
+    spot_est <- states_result$spot
+    dy <- states_result$delta
+    
+    cat("✓ States extracted successfully\n")
+    cat("Generating plots...\n")
+    model$plot_results()
+    model$plot_futures()
+    cat("✓ Plots generated successfully\n")
+  }, error = function(e) {
+    cat("ERROR: Could not extract states or generate plots - ", e$message, "\n", sep = "")
+    return()
+  })
+  
+  # Summary
+  cat("\n")
+  cat(strrep("=", 65), "\n")
+  cat("SUMMARY STATISTICS\n")
+  cat(strrep("=", 65), "\n")
+  cat(sprintf("Spot price RMSE: $%.4f/barrel\n", sqrt(mean((spot - spot_est)^2))))
+  cat(sprintf("Convenience yield: %.6f to %.6f\n", min(dy), max(dy)))
+  cat(sprintf("Mean convenience yield: %.6f\n", mean(dy)))
+  cat(strrep("=", 65), "\n\n")
+  cat("✓ ANALYSIS COMPLETED SUCCESSFULLY\n\n")
+}
+
+# Run the main function - always execute
+main()
+
+
+```
+
